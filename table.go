@@ -136,7 +136,7 @@ func (ms *MessageSender) tableChanNewSlowMessage(tr *TableRequest) {
 				continue
 			case *snmpgo.EndOfMibView: // legal
 				continue
-			case *snmpgo.Null: // saw this once, was weird
+			case *snmpgo.Null: // SNMP v1 behavior?
 				continue
 			}
 
@@ -230,7 +230,7 @@ func (ms *MessageSender) tableChanNewFastMessage(tr *TableRequest) {
 				bad = true
 			case *snmpgo.EndOfMibView: // legal
 				bad = true
-			case *snmpgo.Null: // saw this once, was weird
+			case *snmpgo.Null: // SNMP v1 behavior?
 				bad = true
 			}
 
