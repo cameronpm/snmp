@@ -136,6 +136,8 @@ func (ms *MessageSender) tableChanNewSlowMessage(tr *TableRequest) {
 				continue
 			case *snmpgo.EndOfMibView: // legal
 				continue
+			case *snmpgo.Null: // saw this once, was weird
+				continue
 			}
 
 			if !vb.Oid.Contains(tr.Oids[idx]) {
@@ -227,6 +229,8 @@ func (ms *MessageSender) tableChanNewFastMessage(tr *TableRequest) {
 			case *snmpgo.NoSucheInstance: // shouldn't be possible?
 				bad = true
 			case *snmpgo.EndOfMibView: // legal
+				bad = true
+			case *snmpgo.Null: // saw this once, was weird
 				bad = true
 			}
 
