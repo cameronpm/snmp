@@ -70,7 +70,6 @@ func (ms *MessageSender) tableChanListener() {
 		case req := <-ms.TC:
 			if req.Slow || req.SnmpV1 {
 				ms.tableChanNewSlowMessage(req)
-
 			} else {
 				ms.tableChanNewFastMessage(req)
 			}
@@ -93,7 +92,6 @@ func (ms *MessageSender) tableChanNewSlowMessage(tr *TableRequest) {
 		version = snmpgo.V1
 	}
 	// This is kept only for SnmpV1 requests
-	prevOids := tr.Oids
 	origMsg := NewMessageWithOids(version, snmpgo.GetNextRequest, tr.Community, tr.Oids)
 	var onResp func(r MessageResponse)
 	onResp = func(r MessageResponse) {
@@ -106,17 +104,6 @@ func (ms *MessageSender) tableChanNewSlowMessage(tr *TableRequest) {
 
 		pdu := r.Response.Pdu
 		pvbs := pdu.VarBinds()
-
-		if tr.SnmpV1 && pdu.ErrorStatus() == snmpgo.NoSuchName {
-			for i := 0; i < len(off); i++ {
-				if pdu.ErrorIndex() == i {
-					continue
-				}
-				next = append(next, prevOids[i])
-				nextOff = append(nextOff, off[i])
-			}
-			goto V1_ERROR_SKIP
-		}
 
 		if len(pvbs) != len(off) {
 			tr.send(ctx, nil, &ErrMalformedResponse{
@@ -147,7 +134,6 @@ func (ms *MessageSender) tableChanNewSlowMessage(tr *TableRequest) {
 			vbs[idx] = append(vbs[idx], vb)
 			nextOff = append(nextOff, off[i])
 		}
-	V1_ERROR_SKIP:
 		off = nextOff
 
 		if len(off) == 0 {
@@ -160,7 +146,6 @@ func (ms *MessageSender) tableChanNewSlowMessage(tr *TableRequest) {
 			Message:  NewMessageWithOids(version, snmpgo.GetNextRequest, tr.Community, next),
 			Response: onResp,
 		}
-		prevOids = next
 		if tr.Retries != 0 && tr.TimeoutAfter != 0 {
 			mr.Retries(tr.Retries, tr.TimeoutAfter)
 		}
@@ -224,9 +209,9 @@ func (ms *MessageSender) tableChanNewFastMessage(tr *TableRequest) {
 
 			var bad bool
 			switch vb.Variable.(type) {
-			case *snmpgo.NoSucheObject: // legal if base OID not implemented
+			case *snmpgo.NoSucheObject: // shouldn't be possible in a getnext/getbulk
 				bad = true
-			case *snmpgo.NoSucheInstance: // shouldn't be possible?
+			case *snmpgo.NoSucheInstance: // shouldn't be possible in a getnext/getbulk
 				bad = true
 			case *snmpgo.EndOfMibView: // legal
 				bad = true
