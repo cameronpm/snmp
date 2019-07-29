@@ -7,8 +7,10 @@ import (
 	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/k-sone/snmpgo"
 	"golang.org/x/xerrors"
 )
 
@@ -25,13 +27,15 @@ func (e *ErrMalformedResponse) Error() string {
 // conditions for bulk walks). The response may be sent either to the .Response
 // or .C attributes.
 type MessageRequest struct {
-	Addr    net.Addr // Destination address. Should be *net.UDPAddr unless testing
-	Message *Message // Source message
+	Addr             net.Addr // Destination address. Should be *net.UDPAddr unless testing
+	Message          *Message // Source message
+	DontRetryOnError bool     // Disable (if true) retry of SNMP v1-type errors
 
 	// Response is called when a response comes in. If not nil, it will be
 	// called on the main thread. If it blocks, then the SNMP operations will
 	// block (so be fast!).
 	Response func(response MessageResponse)
+
 	// C is a channel created by the user. If it is not nil, it messages will be
 	// sent to it. If it blocks then SNMP operations will block (so be fast!)
 	C chan MessageResponse
@@ -76,10 +80,8 @@ func (mr *MessageRequest) setRetryCallback(ms *MessageSender) {
 	mr.attempts--
 	mr.timer = time.AfterFunc(mr.timeoutAfter, func() {
 		// Quick check if not shut down
-		select {
-		case <-ms.ctx.Done():
+		if ms.ctx.Err() != nil {
 			return
-		default:
 		}
 
 		rid := int32(mr.Message.Pdu.RequestId())
@@ -123,6 +125,11 @@ type MessageResponse struct {
 type MessageSender struct {
 	MC chan *MessageRequest
 	TC chan *TableRequest
+
+	// Reply that do not match known requests (perhaps the request timed out internally)
+	OrphanedReplies uint64
+	// a valid RequestID was seen in a reply from host B whereas the request was sent to host A
+	IllegalHostReplies uint64
 
 	conn     net.PacketConn
 	ctx      context.Context
@@ -184,7 +191,7 @@ func (o *MessageSenderOpts) OnErr(onErr ErrorLogger) *MessageSenderOpts {
 	return o
 }
 
-// OnErr provides an interface for logging all errors. By default it uses the
+// OnErrFunc provides an interface for logging all errors. By default it uses the
 // 'log' package. This method allows a func instead of interface
 func (o *MessageSenderOpts) OnErrFunc(onErr func(error)) *MessageSenderOpts {
 	o.onErr = logErrFunc(onErr)
@@ -207,7 +214,7 @@ func (e logErrFunc) Log(err error) {
 	e(err)
 }
 
-// NewMessageSenderWithConn sets up *MessageSender to allow sending and receiving of SNMP messages
+// NewMessageSender sets up *MessageSender to allow sending and receiving of SNMP messages
 // asynchronously from a socket.
 //
 // Param ctx will gracefully shut down all goroutines created by this method call.
@@ -310,13 +317,10 @@ func (ms *MessageSender) onRecv() {
 		if err != nil {
 			// Most likely because err.(net.Error).Timeout() == true
 			// At this point not much we care about.
-			select {
-			case <-ms.ctx.Done():
-				return
-			default:
+			if ms.ctx.Err() == nil {
+				ms.cancel()
+				ms.onErr.Log(xerrors.Errorf("error reading from socket: %w", err))
 			}
-			ms.cancel()
-			ms.onErr.Log(xerrors.Errorf("error reading from socket: %w", err))
 			return
 		}
 		res := &Message{}
@@ -324,14 +328,40 @@ func (ms *MessageSender) onRecv() {
 			ms.onErr.Log(xerrors.Errorf("[%s] unable to parse inbound SNMP packet of len %d: %w", addr, n, err))
 			continue
 		}
-		req := ms.findReq(addr, res)
 
+		req := ms.findReq(addr, res)
 		if req == nil {
 			continue
 		}
-		if req.timer != nil {
-			req.timer.Stop()
-			req.timer = nil
+
+		pt := req.Message.Pdu.PduType()
+		if (pt == snmpgo.GetRequest || pt == snmpgo.GetNextRequest) &&
+			len(req.Message.Pdu.VarBinds()) != len(res.Pdu.VarBinds()) {
+			// for _, vb := range req.Message.Pdu.VarBinds() {
+			// 	fmt.Printf("REQ: %s\n", vb.Oid)
+			// }
+			// for _, vb := range res.Pdu.VarBinds() {
+			// 	fmt.Printf("RES: %s\n", vb.Oid)
+			// }
+			req.send(ms.ctx, ms.cbInline, MessageResponse{
+				Request: req.Message,
+				Err: &ErrMalformedResponse{
+					ExpOIDs: len(req.Message.Pdu.VarBinds()),
+					GotOIDs: len(res.Pdu.VarBinds()),
+				},
+			})
+			continue
+		}
+
+		if res.Pdu.ErrorStatus() == snmpgo.NoSuchName {
+			if !req.DontRetryOnError {
+				if len(res.Pdu.VarBinds()) > 1 {
+					ms.queueResendWithOmissions(req, res)
+					continue
+				}
+				// Could just as easily be NoSuchObject as well, or I could leave it blank. Unsure.
+				res.Pdu.VarBinds()[0].Variable = snmpgo.NewNoSucheInstance()
+			}
 		}
 
 		req.send(ms.ctx, ms.cbInline, MessageResponse{
@@ -341,6 +371,51 @@ func (ms *MessageSender) onRecv() {
 	}
 }
 
+func (ms *MessageSender) queueResendWithOmissions(req *MessageRequest, res *Message) {
+	mr := &MessageRequest{
+		Addr:         req.Addr,
+		attempts:     req.attempts,
+		timeoutAfter: req.timeoutAfter,
+		Message: &Message{
+			Community: req.Message.Community,
+			Version:   req.Message.Version,
+			Pdu:       snmpgo.NewPdu(req.Message.Version, req.Message.Pdu.PduType()),
+		},
+	}
+
+	errIdx := res.Pdu.ErrorIndex()
+	errVb := req.Message.Pdu.VarBinds()[errIdx]
+	for i, vb := range req.Message.Pdu.VarBinds() {
+		if errIdx == i {
+			continue
+		}
+		mr.Message.Pdu.AppendVarBind(vb.Oid, snmpgo.NewNull())
+	}
+
+	mr.Response = func(mr MessageResponse) {
+		if mr.Err != nil {
+			req.send(ms.ctx, ms.cbInline, mr)
+		}
+
+		newPdu := snmpgo.NewPdu(mr.Response.Version, mr.Response.Pdu.PduType())
+		newPdu.SetRequestId(mr.Response.Pdu.RequestId())
+		for i, vb := range mr.Response.Pdu.VarBinds() {
+			newPdu.AppendVarBind(vb.Oid, vb.Variable)
+			if errIdx-1 == i {
+				newPdu.AppendVarBind(errVb.Oid, snmpgo.NewNoSucheInstance())
+			}
+		}
+		mr.Response.Pdu = newPdu
+		req.send(ms.ctx, ms.cbInline, MessageResponse{
+			Request:  req.Message,
+			Response: mr.Response,
+			Err:      mr.Err,
+		})
+	}
+
+	ms.MC <- mr
+}
+
 func (ms *MessageSender) findReq(addr net.Addr, res *Message) *MessageRequest {
 	ms.activeMu.Lock()
 	defer ms.activeMu.Unlock()
@@ -348,7 +423,7 @@ func (ms *MessageSender) findReq(addr net.Addr, res *Message) *MessageRequest {
 	//fmt.Printf("findReq(): looking for %d in tab size %d\n", res.Pdu.RequestId(), len(ms.active))
 	req, ok := ms.active[int32(res.Pdu.RequestId())]
 	if !ok {
-		// i wonder what caused this?
+		atomic.AddUint64(&ms.OrphanedReplies, 1)
 		return nil
 	}
 
@@ -357,12 +432,14 @@ func (ms *MessageSender) findReq(addr net.Addr, res *Message) *MessageRequest {
 			if a1.IP.Equal(a2.IP) && a1.Port == a2.Port && a1.Zone == a2.Zone {
 				goto equal
 			}
+			atomic.AddUint64(&ms.IllegalHostReplies, 1)
 			ms.onErr.Log(xerrors.Errorf("[%s] requestId to UDP address, wanted %s", addr, req.Addr))
 			return nil
 		}
 	}
 
 	if addr.String() != req.Addr.String() {
+		atomic.AddUint64(&ms.IllegalHostReplies, 1)
 		ms.onErr.Log(xerrors.Errorf("[%s] requestId to address, wanted %s", addr.String(), req.Addr))
 		return nil
 	}
@@ -370,6 +447,7 @@ func (ms *MessageSender) findReq(addr net.Addr, res *Message) *MessageRequest {
 equal:
 	if req.timer != nil {
 		req.timer.Stop()
+		req.timer = nil
 	}
 	delete(ms.active, int32(res.Pdu.RequestId()))
 	return req

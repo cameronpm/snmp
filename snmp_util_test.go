@@ -90,7 +90,7 @@ func envSetup() (mse *messageSendEnv) {
 		case mse.failMsg <- err:
 		case <-mse.cps.ctx.Done():
 		}
-	})
+	}).CallbackInline(true)
 	mse.ps, _ = NewMessageSender(mse.cps.ctx, opts)
 
 	return

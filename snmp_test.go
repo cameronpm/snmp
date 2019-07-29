@@ -264,6 +264,7 @@ func TestBulkWalk(t *testing.T) {
 				ifInOctets: snmpgo.VarBinds{vbV(ifInOctets, snmpgo.NewNull())},
 			},
 		},
+
 		{
 			msg:  "snmpV1 mid bad",
 			isV1: true,
@@ -491,8 +492,7 @@ func TestBulkWalk(t *testing.T) {
 						Oids:         oids,
 						Community:    []byte("notpublic"),
 						C:            make(chan TableResponse, 1),
-						Retries:      2,
-						TimeoutAfter: 10 * time.Millisecond,
+						TimeoutAfter: 100 * time.Millisecond,
 						Slow:         r.slow,
 						MaxRep:       r.maxRep,
 					}
@@ -501,7 +501,7 @@ func TestBulkWalk(t *testing.T) {
 					select {
 					case msg := <-tr.C:
 						if r.expErr == nil {
-							require.NoError(t, msg.Err, "unexpected error of type %T", msg.Err)
+							require.NoError(t, msg.Err, "unexpected error of type %T [%s]", msg.Err, msg.Err)
 							require.Len(t, msg.VarBinds, len(r.expReply), "varbinds")
 							for i, vbs := range r.expReply {
 								vbsGot := msg.VarBinds[i]
@@ -520,7 +520,7 @@ func TestBulkWalk(t *testing.T) {
 					case failMsg := <-pse.failMsg:
 						t.Fatal(failMsg)
 					case <-tc.Done():
-						//printstack()
+						printstack()
 						t.Fatal("timeout")
 					}
 					successOk()
@@ -536,12 +536,12 @@ func TestBulkWalk(t *testing.T) {
 							_, err := msg.Unmarshal(pkt.p)
 							require.NoError(t, err, "snmpget message parsed")
 
-							// Convert the messsage to a key form we can lookup the
+							// Convert the message to a key form we can lookup the
 							// expected response from
 							wot := pdu2string(msg.Pdu)
 							t.Logf("Got request %s\n", wot)
 							if _, ok := lookup[wot]; !ok {
-								t.Fatal("unhandled inbound request: " + wot)
+								t.Fatalf("unhandled inbound request: '%s'", wot)
 							}
 
 							// Construct and marshal the response
@@ -630,4 +630,3 @@ func BenchmarkSimple(b *testing.B) {
 		_ = NewMessageWithVarBinds(snmpgo.V2c, snmpgo.GetResponse, []byte("notpublic"), snmpgo.VarBinds{vb})
 	}
 }
-
