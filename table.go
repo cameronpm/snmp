@@ -193,7 +193,7 @@ func (tms *tableMessageSender) onResponseErrCheck(r MessageResponse) bool {
 				r.Err = ErrCancelViaUpdate
 			} else if ctxErr != nil {
 				r.Err = ctxErr
-			} else {
+			} else if time.Now().Before(tms.tr.StopAfter) {
 				tms.sendMessageRequest()
 				return true
 			}
