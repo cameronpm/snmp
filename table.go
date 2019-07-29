@@ -186,24 +186,25 @@ func (tms *tableMessageSender) onResponseErrCheck(r MessageResponse) bool {
 	if r.Err == nil && ctxErr != nil {
 		r.Err = ctxErr
 	}
-	if r.Err != nil {
-		if r.Err == ErrTimedOut && tms.tr.TimeoutAfter > 0 {
-			tms.timeouts++
-			if cancel {
-				r.Err = ErrCancelViaUpdate
-			} else if ctxErr != nil {
-				r.Err = ctxErr
-			} else if time.Now().Before(tms.tr.StopAfter) {
-				tms.sendMessageRequest()
-				return true
-			}
-		}
-		tms.tr.send(tms.ctx, nil, r.Err, tms.timeouts, tms.took)
-		return true
+
+	if r.Err == nil {
+		tms.took = append(tms.took, took)
+		return false
 	}
 
-	tms.took = append(tms.took, took)
-	return false
+	tms.timeouts++
+	if r.Err == ErrTimedOut && tms.tr.TimeoutAfter > 0 {
+		if cancel {
+			r.Err = ErrCancelViaUpdate
+		} else if ctxErr != nil {
+			r.Err = ctxErr
+		} else if time.Now().Before(tms.tr.StopAfter) {
+			tms.sendMessageRequest()
+			return true
+		}
+	}
+	tms.tr.send(tms.ctx, nil, r.Err, tms.timeouts, tms.took)
+	return true
 }
 
 func (stms *slowTableMessageSender) onResponse(r MessageResponse) {
